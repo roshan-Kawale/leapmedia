@@ -17,7 +17,7 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import RNFS from 'react-native-fs';
 import CameraRoll from '@react-native-camera-roll/camera-roll';
-import { Video as VideoCompressor } from 'react-native-compressor';
+import { FFmpegKit, ReturnCode, FFmpegKitConfig } from 'ffmpeg-kit-react-native';
 
 const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
 
@@ -36,6 +36,8 @@ const VideoPlayerScreen = ({ route, navigation }) => {
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [showCamera, setShowCamera] = useState(true);
   const [cameraPosition, setCameraPosition] = useState('topRight');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState(0);
 
   const controlsTimer = useRef(null);
   const recordingTimer = useRef(null);
@@ -93,6 +95,12 @@ const VideoPlayerScreen = ({ route, navigation }) => {
             }
           },
         ]
+      );
+    } else if (isProcessing) {
+      Alert.alert(
+        'Processing Video',
+        'Video is being processed. Please wait...',
+        [{ text: 'OK', style: 'default' }]
       );
     } else {
       navigation.goBack();
@@ -152,6 +160,52 @@ const VideoPlayerScreen = ({ route, navigation }) => {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
+  // FFmpeg-based video compression function
+  const compressVideoWithFFmpeg = async (inputPath, outputPath) => {
+    return new Promise((resolve, reject) => {
+      setIsProcessing(true);
+      setProcessingProgress(0);
+
+      // FFmpeg command for transcoding to 960x540 @ 25fps with optimized settings
+      const command = `-i "${inputPath}" -vf "scale=960:540" -r 25 -c:v libx265 -preset medium -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
+
+      console.log('FFmpeg command:', command);
+
+      // Configure progress callback
+      FFmpegKitConfig.enableStatisticsCallback((statistics) => {
+        const timeInMilliseconds = statistics.getTime();
+        if (timeInMilliseconds > 0) {
+          // Estimate progress based on time (this is approximate)
+          const progress = Math.min((timeInMilliseconds / 1000) / 30, 1) * 100; // Assuming ~30s max duration
+          setProcessingProgress(Math.round(progress));
+        }
+      });
+
+      // Execute FFmpeg command
+      FFmpegKit.execute(command).then(async (session) => {
+        const returnCode = await session.getReturnCode();
+        const logs = await session.getAllLogsAsString();
+        
+        setIsProcessing(false);
+        setProcessingProgress(0);
+
+        if (ReturnCode.isSuccess(returnCode)) {
+          console.log('FFmpeg compression successful');
+          resolve(outputPath);
+        } else {
+          console.error('FFmpeg failed with return code:', returnCode);
+          console.error('FFmpeg logs:', logs);
+          reject(new Error(`FFmpeg failed with return code: ${returnCode}`));
+        }
+      }).catch((error) => {
+        setIsProcessing(false);
+        setProcessingProgress(0);
+        console.error('FFmpeg execution error:', error);
+        reject(error);
+      });
+    });
+  };
+
   const startRecording = async () => {
     if (!cameraRef.current || !isCameraReady) {
       Alert.alert('Error', 'Camera is not ready');
@@ -179,7 +233,8 @@ const VideoPlayerScreen = ({ route, navigation }) => {
       // Persist the recorded file into app's documents directory
       const timestamp = Date.now();
       const targetDir = `${RNFS.DocumentDirectoryPath}/recordings`;
-      const targetPath = `${targetDir}/recording_${timestamp}.mp4`;
+      const tempPath = `${targetDir}/temp_recording_${timestamp}.mp4`;
+      const finalPath = `${targetDir}/recording_${timestamp}.mp4`;
 
       try {
         // Ensure target directory exists
@@ -187,36 +242,30 @@ const VideoPlayerScreen = ({ route, navigation }) => {
         if (!dirExists) {
           await RNFS.mkdir(targetDir);
         }
-        // Move the temp file to our app folder
-        await RNFS.moveFile(data.uri.replace('file://', ''), targetPath);
-        console.log('Recording moved to app storage:', targetPath);
 
-        // Transcode to 960x540 @ 25fps using react-native-compressor
-        let finalOutputPath = targetPath;
+        // Move the temp file to our app folder first
+        await RNFS.moveFile(data.uri.replace('file://', ''), tempPath);
+        console.log('Recording moved to temp location:', tempPath);
+
+        // Compress using FFmpeg Kit
         try {
-          const compressedPath = await VideoCompressor.compress(
-            `file://${targetPath}`,
-            {
-              compressionMethod: 'auto',
-              maxSize: 640,
-              bitrate: 1000000,
-              fps: 25,
-              minimumFileSizeForCompress: 0,
-            },
-            () => {}
-          );
-          if (compressedPath && typeof compressedPath === 'string') {
-            const localCompressed = compressedPath.replace('file://', '');
-            try { await RNFS.unlink(targetPath); } catch (e) {}
-            await RNFS.moveFile(localCompressed, targetPath);
-            finalOutputPath = targetPath;
-            console.log('Compression done:', finalOutputPath);
+          await compressVideoWithFFmpeg(tempPath, finalPath);
+          console.log('FFmpeg compression completed:', finalPath);
+          
+          // Clean up temp file
+          try {
+            await RNFS.unlink(tempPath);
+          } catch (e) {
+            console.warn('Failed to delete temp file:', e);
           }
-        } catch (cErr) {
-          console.warn('Compression failed, using original:', cErr);
+
+        } catch (compressionError) {
+          console.warn('FFmpeg compression failed, using original:', compressionError);
+          // If compression fails, use the original file
+          await RNFS.moveFile(tempPath, finalPath);
         }
 
-        // Also copy to the device Downloads/VideoPermissionsApp folder for easy access
+        // Copy to Downloads/VideoPermissionsApp folder for easy access
         try {
           const downloadsDir = `${RNFS.DownloadDirectoryPath}/VideoPermissionsApp`;
           const downloadsTarget = `${downloadsDir}/recording_${timestamp}.mp4`;
@@ -224,20 +273,30 @@ const VideoPlayerScreen = ({ route, navigation }) => {
           if (!downloadsExists) {
             await RNFS.mkdir(downloadsDir);
           }
-          await RNFS.copyFile(finalOutputPath, downloadsTarget);
+          await RNFS.copyFile(finalPath, downloadsTarget);
           console.log('Recording copied to Downloads:', downloadsTarget);
         } catch (dlErr) {
           console.warn('Failed to copy to Downloads:', dlErr);
         }
 
-        // Also save to the device gallery (Camera Roll)
+        // Save to device gallery (Camera Roll)
         try {
-          await CameraRoll.save(`file://${finalOutputPath}`, { type: 'video', album: 'VideoPermissionsApp' });
-          Alert.alert('Saved', 'Recording saved to Gallery and Downloads/VideoPermissionsApp.');
+          await CameraRoll.save(`file://${finalPath}`, { 
+            type: 'video', 
+            album: 'VideoPermissionsApp' 
+          });
+          Alert.alert(
+            'Recording Saved', 
+            'Video has been processed and saved to Gallery and Downloads/VideoPermissionsApp.'
+          );
         } catch (galleryErr) {
           console.warn('Failed to save to gallery:', galleryErr);
-          Alert.alert('Saved', 'Recording saved to app storage and Downloads/VideoPermissionsApp.');
+          Alert.alert(
+            'Recording Saved', 
+            'Video has been processed and saved to Downloads/VideoPermissionsApp.'
+          );
         }
+
       } catch (fsErr) {
         console.error('Failed to save recording:', fsErr);
         Alert.alert('Save Error', 'Recording completed but failed to save.');
@@ -248,6 +307,8 @@ const VideoPlayerScreen = ({ route, navigation }) => {
       Alert.alert('Error', 'Failed to record video');
     } finally {
       setIsRecording(false);
+      setIsProcessing(false);
+      setProcessingProgress(0);
       if (recordingTimer.current) {
         clearInterval(recordingTimer.current);
       }
@@ -334,6 +395,26 @@ const VideoPlayerScreen = ({ route, navigation }) => {
           </View>
         )}
 
+        {/* Processing Overlay */}
+        {isProcessing && (
+          <View style={styles.processingOverlay}>
+            <ActivityIndicator size="large" color="#fff" />
+            <Text style={styles.processingText}>
+              Processing video... {processingProgress}%
+            </Text>
+            <View style={styles.progressBarContainer}>
+              <View style={styles.progressBar}>
+                <View 
+                  style={[
+                    styles.progressFill, 
+                    { width: `${processingProgress}%` }
+                  ]} 
+                />
+              </View>
+            </View>
+          </View>
+        )}
+
         {/* PiP Camera */}
         {showCamera && (
           <View style={[styles.cameraContainer, getCameraStyle()]}>
@@ -387,7 +468,7 @@ const VideoPlayerScreen = ({ route, navigation }) => {
         )}
 
         {/* Video Controls Overlay */}
-        {showControls && (
+        {showControls && !isProcessing && (
           <View style={styles.controlsOverlay}>
             {/* Top Controls */}
             <SafeAreaView style={styles.topControls}>
@@ -451,7 +532,26 @@ const VideoPlayerScreen = ({ route, navigation }) => {
                 </Text>
               </View>
 
-              {/* Recording is now automatic with playback; manual button removed */}
+              {/* Manual recording control (optional) */}
+              <View style={styles.actionButtons}>
+                <TouchableOpacity 
+                  style={[
+                    styles.recordButton, 
+                    isRecording && styles.recordButtonActive
+                  ]}
+                  onPress={toggleRecording}
+                  disabled={!showCamera || !isCameraReady}
+                >
+                  <Icon 
+                    name={isRecording ? "stop" : "fiber-manual-record"} 
+                    size={16} 
+                    color="#fff" 
+                  />
+                  <Text style={styles.recordButtonText}>
+                    {isRecording ? 'Stop' : 'Record'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </SafeAreaView>
           </View>
         )}
@@ -488,6 +588,24 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     marginTop: 10,
+  },
+  processingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    zIndex: 1000,
+  },
+  processingText: {
+    color: '#fff',
+    fontSize: 18,
+    marginTop: 20,
+    marginBottom: 20,
+    fontWeight: '600',
   },
   cameraContainer: {
     position: 'absolute',
